@@ -1,9 +1,11 @@
 import streamlit as st
 import pandas as pd
 from pathlib import Path
+from dotenv import load_dotenv
 from agent.llm import GeminiClient
 from agent.functions import TutorFunctions
 
+load_dotenv(override=True)  # prefer .env value in dev
 st.set_page_config(page_title="Sinhala-English Tutor", page_icon="📚", layout="wide")
 
 @st.cache_data

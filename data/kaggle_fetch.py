@@ -7,21 +7,35 @@ import pandas as pd
 # KAGGLE_USERNAME and KAGGLE_KEY
 
 DATA_DIR = Path(__file__).parent
+REPO_ROOT = DATA_DIR.parent
+LOCAL_KAGGLE_JSON = REPO_ROOT / "kaggle.json"
+
+# If a local kaggle.json exists in the repo root, direct Kaggle API to use it
+if LOCAL_KAGGLE_JSON.exists():
+    os.environ.setdefault("KAGGLE_CONFIG_DIR", str(REPO_ROOT))
 OUT_CSV = DATA_DIR / "vocab.csv"
 
 # Example dataset slug; replace with the exact one used in the notebook if different.
 # This is a placeholder; user should confirm the dataset.
-KAGGLE_DATASET = os.getenv("KAGGLE_DATASET", "sanjaytharanga/sinhala-english-dictionary")
+KAGGLE_DATASET = os.getenv("KAGGLE_DATASET", "programmerrdai/sinhala-english-singlish-translation-dataset")
 
 
 def download_and_prepare():
     try:
         from kaggle.api.kaggle_api_extended import KaggleApi
-    except Exception:
-        raise RuntimeError("kaggle package not installed. Run: pip install kaggle")
+    except Exception as e:
+        raise RuntimeError("kaggle package not installed. Run: pip install kaggle") from e
 
     api = KaggleApi()
-    api.authenticate()
+    try:
+        api.authenticate()
+    except Exception as auth_err:
+        raise RuntimeError(
+            "Kaggle authentication failed. Ensure one of the following:\n"
+            "- %USERPROFILE%\\.kaggle\\kaggle.json exists, or\n"
+            "- Environment variables KAGGLE_USERNAME and KAGGLE_KEY are set, or\n"
+            "- Place kaggle.json in the repo root and we will use it (not recommended to commit)."
+        ) from auth_err
 
     dest = DATA_DIR / "kaggle_download"
     dest.mkdir(exist_ok=True)
@@ -45,10 +59,12 @@ def download_and_prepare():
     df = pd.read_csv(csvs[0])
 
     # Attempt column mapping
+    # Column mapping for multiple dataset schemas.
+    # For 'Sinhala-English-Singlish Translation Dataset', columns are likely: Sinhala, English, Singlish
     mapping_candidates = [
         ("Sinhala", "sinhala"), ("si", "sinhala"), ("si_word", "sinhala"), ("sinhala", "sinhala"),
         ("English", "english"), ("en", "english"), ("en_word", "english"), ("english", "english"),
-        ("Transliteration", "transliteration"), ("roman", "transliteration"), ("transliteration", "transliteration"),
+        ("Singlish", "transliteration"), ("Transliteration", "transliteration"), ("roman", "transliteration"), ("transliteration", "transliteration"),
         ("POS", "pos"), ("pos", "pos"),
         ("Example_SI", "example_si"), ("example_si", "example_si"),
         ("Example_EN", "example_en"), ("example_en", "example_en"),
@@ -64,7 +80,10 @@ def download_and_prepare():
     for col in expected:
         if col not in df.columns:
             df[col] = ""
-    df = df[expected]
+    df = df[expected].fillna("")
+    # Coerce types to string to avoid NaN/None in API
+    for col in expected:
+        df[col] = df[col].astype(str)
 
     df.to_csv(OUT_CSV, index=False, encoding="utf-8")
     return OUT_CSV

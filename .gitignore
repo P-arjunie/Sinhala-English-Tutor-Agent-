@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Node/Next.js
+node_modules/
+.next/
+
+# Kaggle credentials and downloads
+kaggle.json
+data/kaggle_download/
+
+# Env files
+.env
+.env.*
+web/.env.local
+
+# OS
+*.DS_Store
+Thumbs.db
