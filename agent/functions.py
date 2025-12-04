@@ -242,6 +242,16 @@ class TutorFunctions:
         df = df.assign(_score=scores)
         df = df.sort_values(by="_score", ascending=False)
         top = df[df["_score"] > 0].head(k)
-        if top.empty:
-            top = df.head(k)
+        # If no good matches are found, return a random sample to provide some context
+        if len(top) < k:
+            remaining_needed = k - len(top)
+            # Exclude already selected items to avoid duplicates
+            pool = df[~df.index.isin(top.index)]
+            # If the pool is smaller than what we need, take what's available
+            if len(pool) < remaining_needed:
+                remaining_needed = len(pool)
+            # Append a random sample of remaining items
+            random_sample = pool.sample(remaining_needed)
+            top = pd.concat([top, random_sample])
+
         return top.drop(columns=["_score"], errors="ignore").to_dict(orient="records")

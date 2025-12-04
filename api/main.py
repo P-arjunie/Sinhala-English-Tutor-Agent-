@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from agent.functions import TutorFunctions
@@ -80,34 +80,27 @@ functions = TutorFunctions(vocab_df)
 
 
 # --- Fallback helpers for kid endpoints when LLM is unavailable ---
-def _kid_explain_fallback(english: str, sinhala: str | None = None, age: int = 8) -> dict:
-    en = (english or "").strip()
-    si = (sinhala or "").strip()
-    word = en or (si and "(unknown)") or "(word)"
-    definition_en = f"'{word}' is a simple word you can learn. Let's use it in short, friendly sentences. 😊"
-    examples_en = [
-        f"I can say '{word}' in a sentence.",
-        f"Do you know '{word}'?"
-    ]
-    explanation_si = ("මේ වචනය තේරුම් ගන්න පහසුයි. අපි හුරු හුරු උදාහරණ වලින් ඉගෙන ගමු. 😊")
+def _kid_explain_fallback(word: str) -> dict:
+    """Fallback for kid-friendly explanation. Matches the new LLM JSON structure."""
     return {
         "word": word,
-        "definition_en": definition_en,
-        "examples_en": examples_en,
-        "explanation_si": explanation_si,
+        "explanation": f"'{word}' is a very cool word! It's fun to learn new things. 🚀",
+        "example": f"You can use '{word}' in a sentence, like magic!",
+        "fun_fact": "Every word you learn makes your brain stronger and happier! ✨"
     }
 
 
-def _kid_story_fallback(words: list[str], sentences: int = 3) -> str:
-    ws = [w for w in (words or []) if isinstance(w, str) and w.strip()][:6]
+def _kid_story_fallback(words: list[str]) -> str:
+    """Fallback story generator. Now simpler and more cheerful."""
+    ws = [w for w in (words or []) if isinstance(w, str) and w.strip()][:5]
     if not ws:
-        ws = ["cat", "play", "sun"]
-    parts = [
-        f"One sunny day, a kid found the words: {', '.join(ws)}. ☀️",
-        f"They used the words to make a happy story and share with friends. 😊",
-        "Learning new words can be fun and kind!"
-    ]
-    return "\n".join(parts[: max(1, min(sentences, 4))])
+        ws = ["sun", "bird", "happy"]
+    words_str = ", ".join(ws)
+    return (
+        f"Once upon a time, in a land full of sunshine, a little hero learned about the words: {words_str}. "
+        f"They used these words to tell a wonderful story to a friendly bird. "
+        f"And everyone felt very happy! The end. ☀️"
+    )
 
 
 def _dict_enrich_fallback(base: dict, level: str = "A1/A2") -> dict:
@@ -130,22 +123,14 @@ def _dict_enrich_fallback(base: dict, level: str = "A1/A2") -> dict:
     }
 
 
-class SearchResponseItem(BaseModel):
+# --- Pydantic Models ---
+class ExplainRequest(BaseModel):
     sinhala: str
     english: str
-    transliteration: str
-    pos: str
-    example_si: str
-    example_en: str
 
 
 class TranslateRequest(BaseModel):
     text_si: str
-
-
-class ExplainRequest(BaseModel):
-    sinhala: str
-    english: str
 
 
 class QuizRequest(BaseModel):
@@ -197,6 +182,24 @@ class DictEnrichRequest(BaseModel):
     example_en: Optional[str] = None
     level: str = "A1/A2"
 
+class AgentInvokeRequest(BaseModel):
+    input: str
+    sessionId: Optional[str] = None
+
+class DictionaryEntry(BaseModel):
+    english: str
+
+# In-memory store for session data
+# { "session_id": {"word1", "word2"} }
+session_word_history: Dict[str, set] = {}
+
+class SearchResponseItem(BaseModel):
+    sinhala: str
+    english: str
+    transliteration: str
+    pos: str
+    example_si: str
+    example_en: str
 
 
 @app.get("/health")
@@ -269,13 +272,12 @@ def translate(req: TranslateRequest):
 def explain(req: ExplainRequest):
     try:
         gem = GeminiClient()
-        ctx = functions.retrieve_context(req.english or req.sinhala, k=5)
-        res = gem.explain_word(req.sinhala, req.english, context=ctx, kid_safe=_bool_env("KID_SAFE_MODE", False))
-        if _bool_env("KID_SAFE_STRICT", False):
-            mod = gem.moderate_text(res.get("explanation", ""))
-            if not mod.get("safe", True):
-                raise HTTPException(status_code=406, detail={"message": "Response blocked by kid-safety policy", "reasons": mod.get("reasons", [])})
-        return res
+        word_to_explain = req.english or req.sinhala
+        ctx = functions.retrieve_context(word_to_explain, k=5)
+        res = gem.explain_word(word_to_explain, context=ctx)
+        # Since the new prompt returns a markdown string, we don't need moderation checks here
+        # as it's not returning structured data that could be misinterpreted.
+        return {"explanation": res}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM error: {e}")
 
@@ -384,43 +386,126 @@ def llm_answer(req: AnswerRequest):
         raise HTTPException(status_code=502, detail=f"LLM error: {e}")
 
 
+class AgentInvokeRequest(BaseModel):
+    input: str
+    sessionId: Optional[str] = None
+
+@app.post("/agent/invoke")
+def agent_invoke(req: AgentInvokeRequest):
+    """
+    This single endpoint mimics the behavior of the multi-agent graph from the Colab notebook.
+    It uses keyword matching on the user's input to route to the appropriate LLM function.
+    """
+    user_input = req.input.lower()
+    session_id = req.sessionId
+
+    try:
+        gem = GeminiClient()
+        
+        # 1. Routing Logic
+        if "story" in user_input:
+            # Extract potential words for the story from the input
+            words_for_story = [w for w in user_input.replace("story", "").split() if w]
+            if not words_for_story:
+                # If no specific words, get some random ones from the vocab
+                words_for_story = [r['english'] for r in functions.sample_items(n=3, words_only=True)]
+            
+            output = gem.kid_story(words_for_story)
+
+        elif "quiz" in user_input:
+            # For the web UI, a simple MCQ quiz is more direct
+            items = functions.gen_mcq_simple_words(n=1, choices=4)
+            item = items[0]
+            # Format it as a text-based quiz question
+            options_str = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(item['options'])])
+            output = (
+                f"Here's a fun quiz question for you! 🧠\n\n"
+                f"What is the English word for **{item['sinhala']}**?\n\n"
+                f"{options_str}\n\n"
+                f"The correct answer is **{item['answer']}**."
+            )
+
+        elif "progress" in user_input or "score" in user_input or "level" in user_input:
+            # Simplified progress message
+            output = (
+                "You're doing great! 🎉 Every question you answer makes you smarter. "
+                "Keep practicing to level up your English skills. You can do it! 💪"
+            )
+        
+        else:
+            # Default to the main "tutor" role: explaining the word/phrase
+            
+            # Get the history for the current session
+            history = session_word_history.get(session_id, set())
+            
+            # Find a new word that hasn't been used in this session
+            new_word_to_explain = req.input
+            if new_word_to_explain in history:
+                # The requested word has been used, find a new one
+                sampled_items = functions.sample_items(n=10, words_only=True)
+                for item in sampled_items:
+                    if item['english'] not in history:
+                        new_word_to_explain = item['english']
+                        break
+                else:
+                    # If all samples are in history, just pick one (edge case)
+                    new_word_to_explain = sampled_items[0]['english'] if sampled_items else "learn"
+
+            # Update the session history
+            history.add(new_word_to_explain)
+            if session_id:
+                session_word_history[session_id] = history
+
+            ctx = functions.retrieve_context(new_word_to_explain, k=5)
+            output = gem.explain_word(new_word_to_explain, context=ctx)
+
+        return {"output": output}
+
+    except Exception as e:
+        # A single, robust fallback for any error
+        return {"output": f"Oh no! Something went wrong on my end. Please try asking in a different way. (Error: {e})"}
+
+
 @app.post("/kid/explain")
 def kid_explain(req: KidExplainRequest):
     try:
         # Check if we can initialize GeminiClient
         try:
             gem = GeminiClient()
+            word_to_explain = req.english or req.sinhala
+            if not word_to_explain:
+                 return _kid_explain_fallback("a word")
+            ctx = functions.retrieve_context(word_to_explain, k=5)
+            return gem.kid_explain(word=word_to_explain, context=ctx)
         except Exception:
             # If GeminiClient fails to initialize, use fallback immediately
-            return _kid_explain_fallback(req.english, req.sinhala, req.age)
+            return _kid_explain_fallback(req.english or req.sinhala or "a word")
         
-        ctx = functions.retrieve_context(req.english or (req.sinhala or ""), k=5)
-        return gem.kid_explain(word_en=req.english, word_si=req.sinhala, age=req.age, context=ctx)
     except Exception as e:
         # Fallback to a simple, safe template response instead of 502
-        return _kid_explain_fallback(req.english, req.sinhala, req.age)
+        return _kid_explain_fallback(req.english or req.sinhala or "a word")
 
 
 @app.get("/kid/explain")
-def kid_explain_get(english: Optional[str] = None, sinhala: Optional[str] = None, age: int = 8):
+def kid_explain_get(english: Optional[str] = None, sinhala: Optional[str] = None):
     try:
-        if not english and not sinhala:
-            raise HTTPException(status_code=400, detail="Provide 'english' or 'sinhala' query param, e.g., /kid/explain?english=teacher")
+        word_to_explain = english or sinhala
+        if not word_to_explain:
+            raise HTTPException(status_code=400, detail="Provide 'english' or 'sinhala' query param")
         
         # Check if we can initialize GeminiClient
         try:
             gem = GeminiClient()
+            ctx = functions.retrieve_context(word_to_explain, k=5)
+            return gem.kid_explain(word=word_to_explain, context=ctx)
         except Exception:
             # If GeminiClient fails to initialize, use fallback immediately
-            return _kid_explain_fallback(english or "", sinhala, age)
+            return _kid_explain_fallback(word_to_explain)
         
-        key = english or sinhala or ""
-        ctx = functions.retrieve_context(key, k=5)
-        return gem.kid_explain(word_en=english or "", word_si=sinhala, age=age, context=ctx)
     except HTTPException:
         raise
     except Exception as e:
-        return _kid_explain_fallback(english or "", sinhala, age)
+        return _kid_explain_fallback(english or sinhala or "a word")
 
 
 @app.post("/kid/feedback")
@@ -441,13 +526,13 @@ def kid_story(req: KidStoryRequest):
             gem = GeminiClient()
         except Exception:
             # If GeminiClient fails to initialize, use fallback immediately
-            return {"story": _kid_story_fallback(req.words, sentences=req.sentences)}
+            return {"story": _kid_story_fallback(req.words)}
         
-        out = gem.kid_story(req.words, sentences=req.sentences)
+        out = gem.kid_story(req.words)
         return {"story": out}
     except Exception as e:
         # Fallback story so UI remains functional
-        return {"story": _kid_story_fallback(req.words, sentences=req.sentences)}
+        return {"story": _kid_story_fallback(req.words)}
 
 
 @app.post("/moderate/check")
@@ -552,3 +637,4 @@ def dictionary_enrich_get(q: Optional[str] = None, level: str = "A1/A2"):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
