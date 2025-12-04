@@ -3,6 +3,7 @@
 import os
 import json
 import re
+import random
 from typing import List, Dict, Any, Optional
 
 # We will standardize on the google.generativeai library (referred to as v1 in previous logic)
@@ -191,48 +192,85 @@ class GeminiClient:
             prompt = self._kid_guidelines() + prompt
         return self._generate(prompt)
 
-    # --- Kid-friendly helpers ---
-    def moderate_text(self, text: str) -> Dict[str, Any]:
-        prompt = f'Classify as JSON {{"safe": bool, "reasons": [str]}}. Unsafe if violence, sex, hate, drugs, swearing, self-harm.\nText: {text}'
-        raw = self._generate(prompt)
-        try:
-            return json.loads(self._clean_json_response(raw))
-        except:
-            return {"safe": True, "reasons": []}
-
-    def kid_feedback(self, user_answer: str, correct_answer: str) -> str:
+    def generate_mcq_with_llm(self, n: int = 1, choices: int = 4, kid_safe: bool = False) -> List[Dict[str, Any]]:
+        """
+        Generates a high-quality MCQ question using the LLM.
+        This provides more engaging and contextually relevant questions than the simple random sampler.
+        """
+        # Get a few random words from the simple list to seed the question generation
+        seed_words_df = self.vocab[self.vocab["english"].str.len() <= 8]
+        if seed_words_df.empty:
+            seed_words_df = self.vocab
         
-        prompt = (
-            f"{self._kid_guidelines()}"
-            f"User said: {user_answer}\nCorrect: {correct_answer}\n"
-            "Give warm, encouraging feedback in Sinhala with emoji. Never say wrong!"
-        )
-        return self._generate(prompt)
+        seed_items = seed_words_df.sample(min(5, len(seed_words_df))).to_dict(orient="records")
+        
+        examples_str = "\n".join([f"- {item['sinhala']} -> {item['english']}" for item in seed_items])
 
-    def kid_story(self, words: List[str]) -> str:
-        """Generate a short, simple story for kids using a list of words."""
-        words_str = ", ".join(words)
+        persona = self._kid_guidelines() if kid_safe else "You are a helpful language quiz creator."
+
         prompt = f"""
-        **Persona:** You are a magical storyteller for kids. Your stories are simple, fun, and always have a happy ending.
+        {persona}
 
-        **Task:** Write a very short story (about 5-7 sentences) for a 5-8 year old child. The story MUST include all of the following words: **{words_str}**.
+        **Task:** Create {n} multiple-choice question (MCQ) to test a user's Sinhala to English vocabulary.
 
         **Instructions:**
-        1.  Weave all the words from the list naturally into the story.
-        2.  The story should have a clear beginning, a middle, and a happy end.
-        3.  Keep the sentences short and easy to understand.
-        4.  Make the story imaginative and cheerful!
-        5.  The story must start with this "කොහොමද පුංචි දරුවො 😊 අපි අද ලස්සන පුංචි කතාවක් කියවමු ද🙈. 
-            මුලින්ම අපි ඉංග්‍රීසියෙන් කතාව කියවලා ඉමු. 🤓👩🏻‍🏫 බලන්න කතාව තේරෙනව ද කියල 🧚‍♀. ඔයා දන්නෙ නැති වචන තියෙනව නම් dictionary page එකෙන් තේරුම බලන්නත් පුළුවන් 🙈"
-        6. Then translate the entire story into Sinhala script, keeping it simple and fun. before the Sinhala story start these lines should be printed: 
-            " WOW!! You did it 🎉 ඔයා නියමයිනෙ 😊 දැන් එහෙනම් බලමු ද අපි ඒ කතාව සිංහලෙන් 👀 බලන්න ඔයා තේරුම් ගත්තා හරි ද කියල "
+        1.  Pick one interesting Sinhala word from the examples below.
+        2.  The "question" should be the Sinhala word.
+        3.  The "answer" must be the correct single English translation.
+        4.  Generate {choices - 1} incorrect but plausible English distractor options. The distractors should be common, single words and ideally related in some way (e.g., similar category, opposite meaning) to make the quiz challenging but fair.
+        5.  Do NOT use any of the other English words from the examples as distractors. Be creative.
+        6.  The final output MUST be ONLY a single valid JSON object in a list, like `[ {{ ... }} ]`. Do not add any other text or markdown.
 
-        **Example Structure:**
-        *   Once upon a time... (beginning)
-        *   One day, something happened... (middle)
-        *   In the end, everyone was happy... (end)
+        **Examples to pick from:**
+        {examples_str}
+
+        **JSON Output Format for each question:**
+        {{
+          "sinhala": "The chosen Sinhala word",
+          "options": ["correct_answer", "distractor1", "distractor2", "distractor3"],
+          "answer": "The correct English translation"
+        }}
         """
-        return self._generate(prompt)
+        
+        response_text = self._generate(prompt)
+        
+        try:
+            # Clean the response and load the JSON
+            cleaned_json_str = self._clean_json_response(response_text)
+            if not cleaned_json_str.strip().startswith('['):
+                cleaned_json_str = f"[{cleaned_json_str}]"
+
+            mcq_data = json.loads(cleaned_json_str)
+
+            # Post-process to add answer_index and other fields
+            processed_mcqs = []
+            for item in mcq_data:
+                if "answer" in item and "options" in item:
+                    # Ensure options are shuffled
+                    random.shuffle(item["options"])
+                    try:
+                        item["answer_index"] = item["options"].index(item["answer"])
+                        # Add other fields for compatibility
+                        item["transliteration"] = ""
+                        item["pos"] = ""
+                        item["answer_explanation"] = ""
+                        processed_mcqs.append(item)
+                    except ValueError:
+                        # The correct answer wasn't in the options, skip this item
+                        continue
+            
+            if processed_mcqs:
+                return processed_mcqs
+            else:
+                # Fallback if LLM output was invalid
+                raise ValueError("LLM produced invalid MCQ format.")
+
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"LLM-based MCQ generation failed: {e}. Falling back to simple generator.")
+            # Fallback to the old method if LLM fails
+            from agent.functions import TutorFunctions
+            tf = TutorFunctions(self.vocab)
+            return tf.gen_mcq_simple_words(n=n, choices=choices)
 
     def summarize_session(self, words: List[str]) -> str:
         """Generates a summary of the words learned in the session."""

@@ -4,8 +4,43 @@ import pandas as pd
 import re
 
 class TutorFunctions:
-    def __init__(self, vocab: pd.DataFrame):
-        self.vocab = vocab
+    """Encapsulates functions for the tutor agent."""
+
+    def __init__(self, vocab_df: pd.DataFrame):
+        """Initializes with a vocabulary DataFrame."""
+        self.vocab = vocab_df
+        self._create_single_word_vocab() # Create the filtered vocab on init
+
+    def _create_single_word_vocab(self):
+        """
+        Filters the main vocabulary to create a DataFrame containing only single-word
+        Sinhala-to-English pairs. This is crucial for generating clean MCQs.
+        """
+        # Drop rows with missing values in either column
+        df = self.vocab.dropna(subset=['sinhala', 'english'])
+        
+        # Filter for rows where both Sinhala and English columns contain a single word
+        # We assume words are separated by spaces.
+        sinhala_is_single = df['sinhala'].str.strip().str.split().str.len() == 1
+        english_is_single = df['english'].str.strip().str.split().str.len() == 1
+        
+        self.single_word_vocab = df[sinhala_is_single & english_is_single].copy()
+
+    def get_word_of_the_day(self) -> Dict[str, str]:
+        """Return a random word of the day as a dictionary with sinhala, english, and transliteration."""
+        import datetime
+        # Seed random with current date for reproducibility
+        random.seed(datetime.datetime.now().date())
+        # Sample a random row
+        sample = self.vocab.sample(1)
+        if sample.empty:
+            return {"sinhala": "", "english": "", "transliteration": ""}
+        row = sample.iloc[0]
+        return {
+            "sinhala": row["sinhala"],
+            "english": row["english"],
+            "transliteration": row.get("transliteration", ""),
+        }
 
     @staticmethod
     def filter_offensive(df: pd.DataFrame, banned: List[str]) -> pd.DataFrame:
@@ -195,12 +230,24 @@ class TutorFunctions:
         result: List[Dict[str, object]] = []
         for row in rows:
             correct = first_word(row.get("english", ""))
-            opts = [correct]
-            for w in english_unique:
-                if len(opts) >= choices:
-                    break
-                if w != correct:
-                    opts.append(w)
+            # Build options by sampling random distractors from the full vocabulary
+            # Exclude the correct answer
+            full_pool = [first_word(e) for e in self.vocab["english"].dropna().tolist() if first_word(e)]
+            # Deduplicate while preserving order
+            full_unique = list(dict.fromkeys(full_pool))
+            # Remove the correct answer from candidate distractors
+            candidates = [w for w in full_unique if w and w != correct]
+            # If not enough candidates, fall back to english_unique ordering
+            if len(candidates) < (choices - 1):
+                candidates = [w for w in english_unique if w and w != correct]
+            # Sample distractors randomly
+            distractors = []
+            try:
+                distractors = random.sample(candidates, k=min(len(candidates), choices - 1))
+            except ValueError:
+                # If sampling fails, just take from candidates sequentially
+                distractors = candidates[: max(0, choices - 1)]
+            opts = [correct] + distractors
             random.shuffle(opts)
             answer_index = opts.index(correct)
             result.append({

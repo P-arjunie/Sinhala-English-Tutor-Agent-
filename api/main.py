@@ -303,6 +303,38 @@ def quiz(req: QuizRequest):
 @app.post("/quiz/mcq", response_model=list[McqItem])
 @app.post("/quiz/mcq/", response_model=list[McqItem])
 def quiz_mcq(req: McqRequest):
+    # Determine if we should use the LLM for generation
+    use_llm_mcq = _bool_env("LLM_MCQ_GENERATION", True) # Default to True
+
+    if use_llm_mcq:
+        try:
+            gem = GeminiClient(model_name="gemini-1.5-flash") # Use a fast model for this
+            items = gem.generate_mcq_with_llm(
+                n=req.n,
+                choices=req.choices,
+                kid_safe=_bool_env("KID_SAFE_MODE", False)
+            )
+            # If explanations requested, generate concise explanations
+            if req.explain:
+                try:
+                    for it in items:
+                        ans = it.get("answer")
+                        ctx = functions.retrieve_context(ans, k=5)
+                        expl = gem.explain_mcq_answer(ans, context=ctx, kid_safe=_bool_env("KID_SAFE_MODE", False))
+                        if _bool_env("KID_SAFE_STRICT", False):
+                            mod = gem.moderate_text(expl)
+                            if not mod.get("safe", True):
+                                expl = "(blocked by safety policy)"
+                        it["answer_explanation"] = expl
+                except Exception:
+                    pass
+            return items
+        except Exception as e:
+            print(f"LLM MCQ generation failed, falling back to local method. Error: {e}")
+            # Fallback to local generation if LLM fails
+            pass
+
+    # --- Local Fallback Generation ---
     # Prepare filtered dataset if needed
     df = vocab_df
     if _bool_env("KID_SAFE_FILTER", False):
@@ -320,6 +352,7 @@ def quiz_mcq(req: McqRequest):
     if df_words.shape[0] < max(3, req.n):
         df_words = df
     temp_funcs = TutorFunctions(df_words)
+    
     # Choose generator based on 'simple' flag
     if req.simple:
         items = temp_funcs.gen_mcq_simple_words(n=req.n, choices=req.choices)
@@ -336,17 +369,16 @@ def quiz_mcq(req: McqRequest):
     if req.explain:
         try:
             gem = GeminiClient()
-            # Explain each answer briefly (kid-safe style optionally)
+            # Explain each answer briefly (kid-safe style optionally) using concise helper
             for it in items:
-                ctx = functions.retrieve_context(it["answer"], k=5)
-                # Use original Sinhala phrase (may be multi-word) but explain reduced English answer word
-                exp_obj = gem.explain_word(it["sinhala"], it["answer"], context=ctx, kid_safe=_bool_env("KID_SAFE_MODE", False))
-                explanation = exp_obj.get("explanation", "")
+                ans = it.get("answer")
+                ctx = functions.retrieve_context(ans, k=5)
+                expl = gem.explain_mcq_answer(ans, context=ctx, kid_safe=_bool_env("KID_SAFE_MODE", False))
                 if _bool_env("KID_SAFE_STRICT", False):
-                    mod = gem.moderate_text(explanation)
+                    mod = gem.moderate_text(expl)
                     if not mod.get("safe", True):
-                        explanation = "(blocked by safety policy)"
-                it["answer_explanation"] = explanation
+                        expl = "(blocked by safety policy)"
+                it["answer_explanation"] = expl
         except Exception:
             # Non-fatal: leave explanations None
             pass
@@ -412,25 +444,29 @@ def agent_invoke(req: AgentInvokeRequest):
             
             output = gem.kid_story(words_for_story)
 
-        elif "quiz" in user_input:
-            # For the web UI, a simple MCQ quiz is more direct
-            items = functions.gen_mcq_simple_words(n=1, choices=4)
-            item = items[0]
+        elif "quiz" in user_input or "mcq" in user_input:
+            # Use the new LLM-based MCQ generation for a high-quality question
+            mcq_items = gem.generate_mcq_with_llm(n=1, choices=4, kid_safe=_bool_env("KID_SAFE_MODE", False))
+            
+            if not mcq_items:
+                 return {"output": "I couldn't think of a good quiz question right now. Please try again!"}
+
+            item = mcq_items[0]
+            
             # Format it as a text-based quiz question
             options_str = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(item['options'])])
             output = (
                 f"Here's a fun quiz question for you! 🧠\n\n"
                 f"What is the English word for **{item['sinhala']}**?\n\n"
                 f"{options_str}\n\n"
-                f"The correct answer is **{item['answer']}**."
+                f"Think carefully! The correct answer is revealed below.\n\n"
+                f"**Answer:** ||{item['answer']}||" # Using spoiler tags for the answer
             )
 
-        elif "progress" in user_input or "score" in user_input or "level" in user_input:
-            # Simplified progress message
-            output = (
-                "You're doing great! 🎉 Every question you answer makes you smarter. "
-                "Keep practicing to level up your English skills. You can do it! 💪"
-            )
+        elif "progress" in user_input or "score" in user_input or "level" in user_input or "summary" in user_input:
+            # Get the history for the current session
+            history = session_word_history.get(session_id, set())
+            output = gem.summarize_session(list(history))
         
         else:
             # Default to the main "tutor" role: explaining the word/phrase

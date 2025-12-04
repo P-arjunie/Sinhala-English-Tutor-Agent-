@@ -159,7 +159,7 @@ export default function HomePage() {
         <div style={styles.inputArea}>
           <input
             value={query}
-            placeholder="Ask me for a 'lesson', 'story', or 'quiz'..."
+            placeholder="Ask me for a 'word', 'story', or 'quiz'..."
             onChange={(e) => setQuery(e.target.value)}
             style={styles.input}
             onKeyDown={(e) => {
